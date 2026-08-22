@@ -5,15 +5,22 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"taskt114-jobsched/internal/model"
 
 	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // ErrNotFound is returned when a requested job does not exist.
 var ErrNotFound = errors.New("store: job not found")
+
+// ErrJobExists is returned by CreateJob when a row with the same id is already
+// present. Recurring schedules produce deterministic job ids per fire time, so
+// this signals "that fire was already recorded" rather than a real failure.
+var ErrJobExists = errors.New("store: job already exists")
 
 // Store is a SQLite-backed persistence layer for the scheduler.
 type Store struct {
@@ -160,6 +167,12 @@ func (s *Store) CreateJob(j *model.Job) error {
 		j.Attempts, j.MaxAttempts, j.LastError, j.Result, j.Priority,
 	)
 	if err != nil {
+		// A duplicate primary key means this fire time was already recorded
+		// (e.g. a recurring schedule being re-driven after a restart). Surface
+		// it distinctly so callers can advance their cursor instead of failing.
+		if isUniqueConstraintError(err) {
+			return ErrJobExists
+		}
 		return fmt.Errorf("insert job: %w", err)
 	}
 	return nil
@@ -493,11 +506,18 @@ func (s *Store) CreateSchedule(sc *model.Schedule) error {
 	if sc.CreatedAt.IsZero() {
 		sc.CreatedAt = now
 	}
+	// A zero LastRun means "never fired"; persist it as 0 so DueSchedules'
+	// last_run=0 branch matches and NextRun treats it as the first run. Storing
+	// the raw UnixNano() of a zero time would write a large negative value.
+	lastRun := int64(0)
+	if !sc.LastRun.IsZero() {
+		lastRun = sc.LastRun.UnixNano()
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO schedules(id, queue, type, args, interval_ms, enabled, last_run, max_attempts, priority, created_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		sc.ID, sc.Queue, sc.Type, sc.Args,
-		sc.Interval.Milliseconds(), boolToInt(sc.Enabled), sc.LastRun.UnixNano(),
+		sc.Interval.Milliseconds(), boolToInt(sc.Enabled), lastRun,
 		sc.MaxAttempts, sc.Priority, sc.CreatedAt.UnixNano(),
 	)
 	if err != nil {
@@ -540,7 +560,14 @@ func (s *Store) scanSchedule(row interface {
 	sc.Args = args
 	sc.Interval = time.Duration(intervalMs) * time.Millisecond
 	sc.Enabled = enabled != 0
-	sc.LastRun = time.Unix(0, lastRun)
+	// last_run is stored as 0 for "never fired"; preserve that as the zero
+	// time so NextRun/MissedRuns treat the schedule as fresh instead of as
+	// having fired at the Unix epoch.
+	if lastRun == 0 {
+		sc.LastRun = time.Time{}
+	} else {
+		sc.LastRun = time.Unix(0, lastRun)
+	}
 	sc.CreatedAt = time.Unix(0, createdAt)
 	return sc, nil
 }
@@ -627,4 +654,23 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// isUniqueConstraintError reports whether err is a SQLite UNIQUE constraint
+// violation. modernc returns a *sqlite.Error whose Code() is one of the
+// constraint extended codes; we fall back to the canonical message text for
+// any driver variant we cannot type-assert.
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if c, ok := err.(interface{ Code() int }); ok {
+		code := c.Code()
+		if code == sqlite3.SQLITE_CONSTRAINT ||
+			code == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY ||
+			code == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }

@@ -4,6 +4,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -236,7 +237,20 @@ func (p *Pool) fireDueSchedules(ctx context.Context) {
 				MaxAttempts: sc.MaxAttempts,
 				Priority:    sc.Priority,
 			}
-			if err := p.store.CreateJob(j); err != nil {
+			err := p.store.CreateJob(j)
+			if errors.Is(err, store.ErrJobExists) {
+				// This fire time was already recorded (e.g. the schedule is
+				// being re-driven after a restart, or the previous tick raced
+				// a duplicate). Treat it as fired: advance last_run past this
+				// slot so the cursor keeps moving instead of stalling on it.
+				_ = p.store.TouchSchedule(sc.ID, runAt)
+				runAt = runAt.Add(sc.Interval)
+				continue
+			}
+			if err != nil {
+				// A genuine store error: stop firing this schedule for now,
+				// but leave last_run untouched so we retry the same slot next
+				// tick rather than silently skipping it.
 				break
 			}
 			p.metrics.IncEnqueued()
