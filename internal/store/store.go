@@ -136,9 +136,15 @@ func (s *Store) scanJob(row interface {
 
 const jobColumns = `id,queue,type,args,state,run_at,created_at,updated_at,attempts,max_attempts,last_error,result,priority`
 
-// CreateJob inserts a new job. The caller must have validated it.
-func (s *Store) CreateJob(j *model.Job) error {
-	now := time.Now()
+// execer is satisfied by *sql.DB and *sql.Tx, letting insertJob run against
+// either a top-level connection or an open transaction.
+type execer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+// insertJob applies the job defaults and runs the INSERT on exec. It does not
+// validate; the caller must have validated the job.
+func insertJob(exec execer, j *model.Job, now time.Time) error {
 	if j.CreatedAt.IsZero() {
 		j.CreatedAt = now
 	}
@@ -152,15 +158,46 @@ func (s *Store) CreateJob(j *model.Job) error {
 	if j.RunAt.IsZero() {
 		j.RunAt = now
 	}
-	_, err := s.db.Exec(
+	_, err := exec.Exec(
 		`INSERT INTO jobs(id,queue,type,args,state,run_at,created_at,updated_at,attempts,max_attempts,last_error,result,priority)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Queue, j.Type, j.Args, string(j.State),
 		j.RunAt.UnixNano(), j.CreatedAt.UnixNano(), j.UpdatedAt.UnixNano(),
 		j.Attempts, j.MaxAttempts, j.LastError, j.Result, j.Priority,
 	)
-	if err != nil {
+	return err
+}
+
+// CreateJob inserts a new job. The caller must have validated it.
+func (s *Store) CreateJob(j *model.Job) error {
+	if err := insertJob(s.db, j, time.Now()); err != nil {
 		return fmt.Errorf("insert job: %w", err)
+	}
+	return nil
+}
+
+// CreateJobs inserts every job in a single transaction so that a failure on any
+// one job rolls back the whole batch: a batch commit either persists every job
+// or none of them, never a half batch.
+func (s *Store) CreateJobs(jobs []*model.Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin batch: %w", err)
+	}
+	// Rollback is a no-op once Commit has succeeded, so it is safe to defer it
+	// and return early on any insert error below.
+	defer tx.Rollback()
+	now := time.Now()
+	for _, j := range jobs {
+		if err := insertJob(tx, j, now); err != nil {
+			return fmt.Errorf("insert job %q: %w", j.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch: %w", err)
 	}
 	return nil
 }

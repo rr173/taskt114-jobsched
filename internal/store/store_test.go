@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -165,5 +166,50 @@ func TestStats(t *testing.T) {
 	}
 	if st.Total != 3 {
 		t.Fatalf("expected total 3, got %d", st.Total)
+	}
+}
+
+// TestCreateJobsAtomic verifies that CreateJobs persists all jobs or none: when
+// one job fails to insert (duplicate id) the whole batch is rolled back.
+func TestCreateJobsAtomic(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+	// Seed a colliding id so the second batch insert fails.
+	if err := s.CreateJob(newJob("c0", "q", "noop", now)); err != nil {
+		t.Fatal(err)
+	}
+	jobs := []*model.Job{
+		newJob("c1", "q", "noop", now),
+		newJob("c0", "q", "noop", now), // collides -> batch must fail
+		newJob("c2", "q", "noop", now),
+	}
+	if err := s.CreateJobs(jobs); err == nil {
+		t.Fatal("expected CreateJobs to fail on duplicate id")
+	}
+	// c1 and c2 must not have been written.
+	for _, id := range []string{"c1", "c2"} {
+		if _, err := s.GetJob(id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected %s absent after rollback, got err=%v", id, err)
+		}
+	}
+	// The colliding c0 must still be the single seeded record.
+	st, _ := s.Stats()
+	if st.Total != 1 {
+		t.Fatalf("expected 1 job after rolled-back batch, got %d", st.Total)
+	}
+}
+
+// TestCreateJobsEmpty is a no-op that must not error.
+func TestCreateJobsEmpty(t *testing.T) {
+	s := openTest(t)
+	if err := s.CreateJobs(nil); err != nil {
+		t.Fatalf("CreateJobs(nil) = %v, want nil", err)
+	}
+	if err := s.CreateJobs([]*model.Job{}); err != nil {
+		t.Fatalf("CreateJobs(empty) = %v, want nil", err)
+	}
+	st, _ := s.Stats()
+	if st.Total != 0 {
+		t.Fatalf("expected 0 jobs, got %d", st.Total)
 	}
 }

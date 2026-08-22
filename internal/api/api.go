@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -166,8 +167,8 @@ func (s *Server) batchJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	ids := make([]string, 0, len(req.Jobs))
-	for _, jr := range req.Jobs {
+	jobs := make([]*model.Job, 0, len(req.Jobs))
+	for i, jr := range req.Jobs {
 		if jr.Queue == "" {
 			jr.Queue = "default"
 		}
@@ -198,15 +199,23 @@ func (s *Server) batchJobs(w http.ResponseWriter, r *http.Request) {
 			MaxAttempts: jr.MaxAttempts,
 			Priority:    jr.Priority,
 		}
+		// Validate every job before writing any of them, so a bad entry never
+		// leaves behind a partial batch.
 		if err := j.Validate(); err != nil {
-			writeError(w, http.StatusBadRequest, "job "+id+": "+err.Error())
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("job %d (%s): %s", i+1, id, err.Error()))
 			return
 		}
-		if err := s.store.CreateJob(j); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		ids = append(ids, id)
+		jobs = append(jobs, j)
+	}
+	// Persist the whole batch in a single transaction: if any job fails to
+	// insert the entire batch is rolled back, leaving no half-written jobs.
+	if err := s.store.CreateJobs(jobs); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ids := make([]string, len(jobs))
+	for i, j := range jobs {
+		ids[i] = j.ID
 	}
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"ids": ids, "count": len(ids)})
 }
