@@ -235,6 +235,28 @@ func (s *Store) Claim(id string) (bool, error) {
 	return n > 0, nil
 }
 
+// Release returns a previously claimed (running) job back to the pending pool
+// so it can be claimed and dispatched again. It is the counterpart of Claim
+// and is used when a job was claimed but never dispatched — for example, when
+// the dispatch context was cancelled while the pool was waiting for a free
+// worker slot. No attempt is recorded and attempts is not incremented, since
+// the handler never ran. A job no longer in the running state (already
+// finished or cancelled elsewhere) yields ErrNotFound.
+func (s *Store) Release(id string) error {
+	res, err := s.db.Exec(
+		`UPDATE jobs SET state='pending', updated_at=? WHERE id=? AND state='running'`,
+		time.Now().UnixNano(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("release job: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Succeed marks a job completed with its result payload.
 func (s *Store) Succeed(id, result string) error {
 	_, err := s.db.Exec(

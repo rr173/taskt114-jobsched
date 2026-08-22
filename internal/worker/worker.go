@@ -103,9 +103,15 @@ func (p *Pool) Flush(ctx context.Context) error {
 		select {
 		case p.sem <- struct{}{}:
 		case <-ctx.Done():
+			// The job was already claimed (its DB row is "running") but no
+			// worker slot was available and the dispatch context was
+			// cancelled before a goroutine could execute it. Release the
+			// claim so the job returns to pending and can be processed on a
+			// later flush instead of being stranded in running forever.
 			p.mu.Lock()
 			delete(p.active, j.ID)
 			p.mu.Unlock()
+			_ = p.store.Release(j.ID)
 			return ctx.Err()
 		}
 		p.wg.Add(1)

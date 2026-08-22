@@ -118,6 +118,35 @@ func TestRequeueDead(t *testing.T) {
 	}
 }
 
+func TestRelease(t *testing.T) {
+	s := openTest(t)
+	j := newJob("j1", "q", "noop", time.Now())
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a claim that the worker later abandons (e.g. dispatch context
+	// cancelled before a slot was available): Release must move the job back
+	// to pending so it can be processed again.
+	claimed, err := s.Claim("j1")
+	if err != nil || !claimed {
+		t.Fatalf("claim: claimed=%v err=%v", claimed, err)
+	}
+	if err := s.Release("j1"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	got, _ := s.GetJob("j1")
+	if got.State != model.StatePending {
+		t.Fatalf("release should move running back to pending, got %s", got.State)
+	}
+	// A job that already finished should not be releasable.
+	if err := s.Succeed("j1", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release("j1"); err != ErrNotFound {
+		t.Fatalf("release of non-running job want ErrNotFound, got %v", err)
+	}
+}
+
 func TestQueuePause(t *testing.T) {
 	s := openTest(t)
 	if err := s.SetPaused("q1", true); err != nil {
