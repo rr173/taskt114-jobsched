@@ -2,9 +2,22 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
+
+// validArgs reports whether s parses as a JSON value. Empty args default to
+// the neutral object "{}" everywhere a job is created, so a non-empty string
+// that does not parse is rejected up front rather than failing later when a
+// worker hands it to a handler.
+func validArgs(s string) bool {
+	if s == "" {
+		return true
+	}
+	var v json.RawMessage
+	return json.Unmarshal([]byte(s), &v) == nil
+}
 
 // State enumerates the lifecycle of a job.
 type State string
@@ -76,6 +89,9 @@ func (j *Job) Validate() error {
 	}
 	if !ValidStates[j.State] {
 		return fmt.Errorf("invalid job state %q", j.State)
+	}
+	if !validArgs(j.Args) {
+		return fmt.Errorf("job args must be valid JSON: %q", j.Args)
 	}
 	if j.MaxAttempts < 1 {
 		return fmt.Errorf("max attempts must be >= 1")

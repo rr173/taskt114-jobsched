@@ -136,8 +136,15 @@ func (s *Store) scanJob(row interface {
 
 const jobColumns = `id,queue,type,args,state,run_at,created_at,updated_at,attempts,max_attempts,last_error,result,priority`
 
-// CreateJob inserts a new job. The caller must have validated it.
+// CreateJob inserts a new job. It validates first so unparseable args
+// (and other malformed fields) are rejected before they reach the database
+// and only surface later when a worker executes the job. This guards the
+// non-HTTP ingestion paths (direct callers, schedule firing) that do not go
+// through the HTTP request decoder.
 func (s *Store) CreateJob(j *model.Job) error {
+	if err := j.Validate(); err != nil {
+		return fmt.Errorf("create job: %w", err)
+	}
 	now := time.Now()
 	if j.CreatedAt.IsZero() {
 		j.CreatedAt = now

@@ -87,3 +87,36 @@ func TestFlushSkipsFuture(t *testing.T) {
 		t.Fatalf("future job expected scheduled, got %s", f.State)
 	}
 }
+
+// TestScheduleWithBadArgsDoesNotSpawnJobs covers the non-HTTP ingestion
+// path: a recurring schedule whose args are unparseable JSON must not
+// enqueue jobs a worker could only fail on. fireDueSchedules should skip
+// the firing entirely.
+func TestScheduleWithBadArgsDoesNotSpawnJobs(t *testing.T) {
+	s, p := newPool(t)
+	// Persist a schedule with broken args directly, bypassing the HTTP layer
+	// (which would otherwise validate). CreateSchedule does not validate, so
+	// this simulates a non-HTTP / pre-existing corrupted schedule.
+	sc := &model.Schedule{
+		ID:          "bad-sched",
+		Queue:       "q",
+		Type:        "noop",
+		Args:        "{not json",
+		Interval:    time.Second,
+		Enabled:     true,
+		MaxAttempts: 3,
+	}
+	if err := s.CreateSchedule(sc); err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	p.fireDueSchedules(context.Background())
+
+	jobs, err := s.ListJobs(store.ListFilter{})
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("expected no jobs spawned from schedule with bad args, got %d: %+v", len(jobs), jobs)
+	}
+}

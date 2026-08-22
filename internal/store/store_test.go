@@ -167,3 +167,33 @@ func TestStats(t *testing.T) {
 		t.Fatalf("expected total 3, got %d", st.Total)
 	}
 }
+
+// TestCreateJobRejectsBadArgs guards the non-HTTP ingestion path: a job
+// whose args are not parseable JSON must be rejected before it reaches the
+// database, so a worker never has to discover it at execution time.
+func TestCreateJobRejectsBadArgs(t *testing.T) {
+	s := openTest(t)
+	j := newJob("bad", "q", "noop", time.Now())
+	j.Args = "{not json"
+	if err := s.CreateJob(j); err == nil {
+		got, _ := s.GetJob("bad")
+		if got != nil {
+			t.Fatalf("job with bad args was persisted: %+v", got)
+		}
+		t.Fatal("expected CreateJob to reject unparseable args, got nil")
+	}
+}
+
+// TestCreateJobAcceptsEmptyArgs confirms the empty-args default still
+// persists (the API path coerces missing args to "{}").
+func TestCreateJobAcceptsEmptyArgs(t *testing.T) {
+	s := openTest(t)
+	j := newJob("empty", "q", "noop", time.Now())
+	j.Args = ""
+	if err := s.CreateJob(j); err != nil {
+		t.Fatalf("empty args should be accepted: %v", err)
+	}
+	if got, _ := s.GetJob("empty"); got == nil {
+		t.Fatal("expected job with empty args to persist")
+	}
+}

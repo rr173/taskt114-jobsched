@@ -20,6 +20,29 @@ func TestJobValidate(t *testing.T) {
 	}
 }
 
+func TestJobValidateArgsJSON(t *testing.T) {
+	base := Job{ID: "a", Queue: "q", Type: "t", State: StatePending, MaxAttempts: 3}
+	for _, args := range []string{"{}", `{"k":1}`, `[]`, "42", `"str"`} {
+		j := base
+		j.Args = args
+		if err := j.Validate(); err != nil {
+			t.Fatalf("args %q should be accepted: %v", args, err)
+		}
+	}
+	for _, args := range []string{"{", `{"k":}`, "not json", "{]}" } {
+		j := base
+		j.Args = args
+		if err := j.Validate(); err == nil {
+			t.Fatalf("args %q should be rejected", args)
+		}
+	}
+	// Empty args is accepted; callers default it to "{}" before persisting.
+	empty := base
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("empty args should be accepted: %v", err)
+	}
+}
+
 func TestJobIsDue(t *testing.T) {
 	now := time.Now()
 	past := Job{RunAt: now.Add(-time.Hour)}

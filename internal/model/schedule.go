@@ -1,6 +1,8 @@
+// Package model defines the durable job scheduler domain types.
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -33,6 +35,12 @@ func (s *Schedule) Validate() error {
 	}
 	if s.Interval <= 0 {
 		return fmt.Errorf("schedule interval must be positive")
+	}
+	if s.Args != "" {
+		var v json.RawMessage
+		if err := json.Unmarshal([]byte(s.Args), &v); err != nil {
+			return fmt.Errorf("schedule args must be valid JSON: %q", s.Args)
+		}
 	}
 	if s.MaxAttempts < 1 {
 		s.MaxAttempts = 3

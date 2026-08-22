@@ -236,6 +236,13 @@ func (p *Pool) fireDueSchedules(ctx context.Context) {
 				MaxAttempts: sc.MaxAttempts,
 				Priority:    sc.Priority,
 			}
+			if err := j.Validate(); err != nil {
+				// A schedule with unparseable args must not spawn jobs that a
+				// worker can only fail later; skip this firing and touch the
+				// schedule so it does not busy-loop.
+				_ = p.store.TouchSchedule(sc.ID, runAt)
+				break
+			}
 			if err := p.store.CreateJob(j); err != nil {
 				break
 			}
