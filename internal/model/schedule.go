@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -20,7 +21,9 @@ type Schedule struct {
 	CreatedAt   time.Time
 }
 
-// Validate checks the schedule carries enough information to be stored.
+// Validate checks the schedule carries enough information to be stored,
+// including that Args parses as JSON so a malformed payload is rejected at
+// save time rather than surfacing later when the schedule fires.
 func (s *Schedule) Validate() error {
 	if s.ID == "" {
 		return fmt.Errorf("schedule id must not be empty")
@@ -33,6 +36,12 @@ func (s *Schedule) Validate() error {
 	}
 	if s.Interval <= 0 {
 		return fmt.Errorf("schedule interval must be positive")
+	}
+	if s.Args != "" {
+		var v json.RawMessage
+		if err := json.Unmarshal([]byte(s.Args), &v); err != nil {
+			return fmt.Errorf("schedule args must be valid JSON: %q", s.Args)
+		}
 	}
 	if s.MaxAttempts < 1 {
 		s.MaxAttempts = 3

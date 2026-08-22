@@ -487,8 +487,15 @@ func (s *Store) RequeueDead(id string) error {
 	return nil
 }
 
-// CreateSchedule persists a recurring schedule.
+// CreateSchedule persists a recurring schedule. It validates first so
+// malformed args (and other invalid fields) are rejected before they reach the
+// database and only surface later when the schedule fires and hands the args to
+// a worker. This guards the non-HTTP ingestion paths (direct callers) that do
+// not go through the HTTP request decoder, matching CreateJob's behaviour.
 func (s *Store) CreateSchedule(sc *model.Schedule) error {
+	if err := sc.Validate(); err != nil {
+		return fmt.Errorf("create schedule: %w", err)
+	}
 	now := time.Now()
 	if sc.CreatedAt.IsZero() {
 		sc.CreatedAt = now
