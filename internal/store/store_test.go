@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -115,6 +116,107 @@ func TestRequeueDead(t *testing.T) {
 	got, _ := s.GetJob("j1")
 	if got.State != model.StatePending {
 		t.Fatalf("requeue should move to pending, got %s", got.State)
+	}
+}
+
+// TestUpdateJobGuardsTerminal ensures an ordinary UpdateJob cannot roll a
+// finished job back into the pending pool, which would re-enter scheduling.
+func TestUpdateJobGuardsTerminal(t *testing.T) {
+	for _, terminal := range []model.State{model.StateSucceeded, model.StateDead, model.StateCancelled} {
+		t.Run(string(terminal), func(t *testing.T) {
+			s := openTest(t)
+			j := newJob("j1", "q", "noop", time.Now())
+			// Seed the job already in the terminal state by transitioning from
+			// pending (an active state), which UpdateJob permits.
+			if err := s.CreateJob(j); err != nil {
+				t.Fatal(err)
+			}
+			j.State = terminal
+			if err := s.UpdateJob(j); err != nil {
+				t.Fatalf("seed terminal state: %v", err)
+			}
+
+			// Now attempt an ordinary update that would revive it to pending.
+			revive := *j
+			revive.State = model.StatePending
+			revive.RunAt = time.Now()
+			err := s.UpdateJob(&revive)
+			if !errors.Is(err, ErrTerminalJob) {
+				t.Fatalf("expected ErrTerminalJob, got %v", err)
+			}
+
+			got, _ := s.GetJob("j1")
+			if got.State != terminal {
+				t.Fatalf("terminal state %s was rolled back to %s", terminal, got.State)
+			}
+		})
+	}
+}
+
+// TestUpdateJobAllowsActiveTransitions confirms ordinary updates still work for
+// jobs in active states (pending/scheduled/running), including moving into a
+// terminal state such as cancelled.
+func TestUpdateJobAllowsActiveTransitions(t *testing.T) {
+	s := openTest(t)
+	j := newJob("j1", "q", "noop", time.Now())
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	j.State = model.StateCancelled
+	if err := s.UpdateJob(j); err != nil {
+		t.Fatalf("update active->cancelled: %v", err)
+	}
+	got, _ := s.GetJob("j1")
+	if got.State != model.StateCancelled {
+		t.Fatalf("expected cancelled, got %s", got.State)
+	}
+}
+
+// TestRetryRevivesDead verifies the explicit Retry lifecycle path can move a
+// dead job back to pending (the legitimate revival route), while refusing
+// succeeded/cancelled/running jobs.
+func TestRetryRevivesDead(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+	j := newJob("j1", "q", "noop", now)
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	j.State = model.StateDead
+	if err := s.UpdateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Retry("j1", now); err != nil {
+		t.Fatalf("retry dead: %v", err)
+	}
+	got, _ := s.GetJob("j1")
+	if got.State != model.StatePending {
+		t.Fatalf("expected pending after retry, got %s", got.State)
+	}
+	if got.LastError != "" {
+		t.Fatalf("retry should clear last error, got %q", got.LastError)
+	}
+
+	// Retry must refuse jobs that are not retryable.
+	for _, st := range []model.State{model.StateSucceeded, model.StateCancelled} {
+		t.Run(string(st), func(t *testing.T) {
+			s := openTest(t)
+			j := newJob("j2", "q", "noop", now)
+			if err := s.CreateJob(j); err != nil {
+				t.Fatal(err)
+			}
+			j.State = st
+			if err := s.UpdateJob(j); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Retry("j2", now); !errors.Is(err, ErrNotRetryable) {
+				t.Fatalf("expected ErrNotRetryable for %s, got %v", st, err)
+			}
+			got, _ := s.GetJob("j2")
+			if got.State != st {
+				t.Fatalf("%s job was revived to %s", st, got.State)
+			}
+		})
 	}
 }
 

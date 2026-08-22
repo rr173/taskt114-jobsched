@@ -178,17 +178,45 @@ func (s *Store) GetJob(id string) (*model.Job, error) {
 	return j, nil
 }
 
-// UpdateJob persists mutable fields of an existing job.
+// ErrTerminalJob is returned by UpdateJob when the persisted job is already in
+// a terminal state (succeeded, dead or cancelled). A finished job must not be
+// rolled back into the pending pool by an ordinary update, otherwise it would
+// re-enter scheduling after the scheduler believed it was done.
+var ErrTerminalJob = errors.New("store: job is terminal, update refused")
+
+// UpdateJob persists mutable fields of an existing job. It guards the terminal
+// states: once a job has reached succeeded/dead/cancelled, an ordinary update is
+// refused so a finished job cannot be revived into the pending pool and
+// rescheduled. Explicit lifecycle transitions (RequeueDead, cancelJob) use their
+// own dedicated, state-checked paths and do not flow through here.
 func (s *Store) UpdateJob(j *model.Job) error {
 	j.UpdatedAt = time.Now()
-	_, err := s.db.Exec(
-		`UPDATE jobs SET queue=?, type=?, args=?, state=?, run_at=?, updated_at=?, attempts=?, max_attempts=?, last_error=?, result=?, priority=? WHERE id=?`,
+	res, err := s.db.Exec(
+		`UPDATE jobs SET queue=?, type=?, args=?, state=?, run_at=?, updated_at=?, attempts=?, max_attempts=?, last_error=?, result=?, priority=?
+		 WHERE id=? AND state NOT IN ('succeeded','dead','cancelled')`,
 		j.Queue, j.Type, j.Args, string(j.State),
 		j.RunAt.UnixNano(), j.UpdatedAt.UnixNano(),
 		j.Attempts, j.MaxAttempts, j.LastError, j.Result, j.Priority, j.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update rows: %w", err)
+	}
+	if n == 0 {
+		// Either the job does not exist at all, or it is terminal and the guard
+		// clause above protected it from being revived.
+		existing, err := s.GetJob(j.ID)
+		if err != nil {
+			return err
+		}
+		if existing.IsTerminal() {
+			return ErrTerminalJob
+		}
+		// Not terminal but still no rows affected: treat as not found.
+		return ErrNotFound
 	}
 	return nil
 }
@@ -482,6 +510,38 @@ func (s *Store) RequeueDead(id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ErrNotRetryable is returned by Retry when the job's current state cannot be
+// retried (e.g. running, succeeded or cancelled).
+var ErrNotRetryable = errors.New("store: job not retryable")
+
+// Retry is the explicit lifecycle entry point that revives a job into the
+// pending pool for another execution attempt. Unlike UpdateJob it is allowed to
+// leave a terminal state, but only when the current state is retryable
+// (pending/dead). lastError is cleared and runAt is reset to now. It returns
+// ErrNotFound when the job does not exist and ErrNotRetryable when the current
+// state cannot be retried.
+func (s *Store) Retry(id string, now time.Time) error {
+	res, err := s.db.Exec(
+		`UPDATE jobs SET state='pending', run_at=?, last_error='', updated_at=? WHERE id=? AND state IN ('pending','dead')`,
+		now.UnixNano(), now.UnixNano(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("retry: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		existing, err := s.GetJob(id)
+		if err != nil {
+			return err
+		}
+		if !model.CanRetry(existing.State) {
+			return ErrNotRetryable
+		}
 		return ErrNotFound
 	}
 	return nil

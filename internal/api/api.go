@@ -284,13 +284,20 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "job cannot be retried from state "+string(j.State))
 		return
 	}
-	j.State = model.StatePending
-	j.RunAt = time.Now()
-	j.LastError = ""
-	if err := s.store.UpdateJob(j); err != nil {
+	// Retry leaves a terminal state, so it must go through the explicit,
+	// state-checked lifecycle path rather than the ordinary UpdateJob, which
+	// refuses to revive finished jobs.
+	if err := s.store.Retry(id, time.Now()); err != nil {
+		if errors.Is(err, store.ErrNotRetryable) {
+			writeError(w, http.StatusConflict, "job cannot be retried from state "+string(j.State))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	j.State = model.StatePending
+	j.RunAt = time.Now()
+	j.LastError = ""
 	writeJSON(w, http.StatusOK, j)
 }
 

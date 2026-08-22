@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"taskt114-jobsched/internal/clock"
 	"taskt114-jobsched/internal/model"
@@ -108,5 +110,99 @@ func TestFlushEndpoint(t *testing.T) {
 	rec := do(t, h, "POST", "/flush", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("flush code %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSucceededJobNotRescheduled guards the regression where an ordinary update
+// could roll a finished job back to pending, re-entering the scheduler. A
+// succeeded job must stay succeeded even after update-like flows, and must not
+// be picked up by a subsequent flush.
+func TestSucceededJobNotRescheduled(t *testing.T) {
+	s, p, h := newServer(t)
+	ctx := context.Background()
+
+	// Create and run a job to completion.
+	rec := do(t, h, "POST", "/jobs", `{"id":"s1","queue":"q","type":"noop","max_attempts":3}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code %d body %s", rec.Code, rec.Body.String())
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Wait()
+
+	j, err := s.GetJob("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.State != model.StateSucceeded {
+		t.Fatalf("expected succeeded, got %s", j.State)
+	}
+
+	// Simulate an ordinary update attempting to revive the finished job back to
+	// pending through the store API (the path that previously caused the bug).
+	j.State = model.StatePending
+	j.RunAt = time.Now()
+	if err := s.UpdateJob(j); !errors.Is(err, store.ErrTerminalJob) {
+		t.Fatalf("expected ErrTerminalJob reviving succeeded job, got %v", err)
+	}
+
+	// The finished job must not be re-dispatched by a subsequent flush.
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Wait()
+	got, _ := s.GetJob("s1")
+	if got.State != model.StateSucceeded {
+		t.Fatalf("succeeded job was rescheduled, state is now %s", got.State)
+	}
+}
+
+// TestRetryEndpointDead verifies the retry endpoint revives a dead job through
+// the explicit lifecycle path, while a succeeded job is refused.
+func TestRetryEndpoint(t *testing.T) {
+	s, p, h := newServer(t)
+	ctx := context.Background()
+
+	// A "fail" job exhausts retries and becomes a dead letter.
+	rec := do(t, h, "POST", "/jobs", `{"id":"d1","queue":"q","type":"fail","max_attempts":1}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code %d body %s", rec.Code, rec.Body.String())
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Wait()
+	dead, _ := s.GetJob("d1")
+	if dead.State != model.StateDead {
+		t.Fatalf("expected dead, got %s", dead.State)
+	}
+
+	// Retry must revive the dead job to pending.
+	rec = do(t, h, "POST", "/jobs/d1/retry", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry code %d body %s", rec.Code, rec.Body.String())
+	}
+	got, _ := s.GetJob("d1")
+	if got.State != model.StatePending {
+		t.Fatalf("expected pending after retry, got %s", got.State)
+	}
+
+	// A succeeded job must be refused.
+	rec = do(t, h, "POST", "/jobs", `{"id":"ok1","queue":"q","type":"noop","max_attempts":1}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create ok1 code %d", rec.Code)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Wait()
+	rec = do(t, h, "POST", "/jobs/ok1/retry", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict retrying succeeded job, got %d body %s", rec.Code, rec.Body.String())
+	}
+	ok, _ := s.GetJob("ok1")
+	if ok.State != model.StateSucceeded {
+		t.Fatalf("succeeded job was revived to %s", ok.State)
 	}
 }
