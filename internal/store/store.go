@@ -15,6 +15,13 @@ import (
 // ErrNotFound is returned when a requested job does not exist.
 var ErrNotFound = errors.New("store: job not found")
 
+// ErrJobRunning is returned when an operation is refused because the job is
+// currently being executed by a worker. Deleting a running job would leave an
+// incomplete lifecycle: the in-flight handler would later write its attempt and
+// terminal state to a row that no longer exists. Callers must wait for the job
+// to finish (or cancel it) before deleting.
+var ErrJobRunning = errors.New("store: job is running")
+
 // Store is a SQLite-backed persistence layer for the scheduler.
 type Store struct {
 	db *sql.DB
@@ -363,20 +370,47 @@ func (s *Store) ListJobs(f ListFilter) ([]model.Job, error) {
 	return all[offset:end], nil
 }
 
-// DeleteJob removes a job and its attempts.
+// DeleteJob removes a job and its attempts. It refuses to delete a job that is
+// currently running: a worker could still be executing the job's handler and
+// would later write its attempt and terminal state to a now-missing row,
+// leaving an incomplete lifecycle record. The caller must wait for the job to
+// finish (or cancel it first) before deleting. ErrJobRunning is returned in
+// that case; ErrNotFound if the job does not exist at all.
 func (s *Store) DeleteJob(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM attempts WHERE job_id=?`, id); err != nil {
-		return fmt.Errorf("delete attempts: %w", err)
-	}
-	res, err := s.db.Exec(`DELETE FROM jobs WHERE id=?`, id)
+	// Attempt the delete while excluding running jobs. The WHERE guard makes the
+	// "still running" check atomic with the delete, so there is no window in
+	// which a worker can claim the job between the check and the delete.
+	res, err := s.db.Exec(`DELETE FROM jobs WHERE id=? AND state!='running'`, id)
 	if err != nil {
 		return fmt.Errorf("delete job: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
+	if n > 0 {
+		// The job was deleted; remove its attempt history too. Attempt rows are
+		// only meaningful alongside their job, so they are cleaned up regardless
+		// of the job's (non-running) terminal state.
+		if _, err := s.db.Exec(`DELETE FROM attempts WHERE job_id=?`, id); err != nil {
+			return fmt.Errorf("delete attempts: %w", err)
+		}
+		return nil
 	}
-	return nil
+	// No row was deleted: either the job does not exist, or it is running.
+	// Distinguish the two so the API can answer 404 vs 409 correctly.
+	row := s.db.QueryRow(`SELECT state FROM jobs WHERE id=?`, id)
+	var state string
+	if err := row.Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("delete job lookup: %w", err)
+	}
+	if state == string(model.StateRunning) {
+		return ErrJobRunning
+	}
+	// The job existed but was in a non-deletable state that changed between the
+	// delete and the lookup (e.g. concurrently transitioned to running). Treat it
+	// as running-safe to be safe; the caller can retry once the job settles.
+	return ErrJobRunning
 }
 
 // Stats aggregates counts by state.

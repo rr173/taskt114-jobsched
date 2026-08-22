@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -165,5 +166,74 @@ func TestStats(t *testing.T) {
 	}
 	if st.Total != 3 {
 		t.Fatalf("expected total 3, got %d", st.Total)
+	}
+}
+
+func TestDeleteJobRefusesRunning(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+
+	// A running job must not be deletable: the worker could still be executing
+	// its handler and would later write its attempt/terminal state to a row
+	// that no longer exists, leaving an incomplete lifecycle record.
+	running := newJob("running", "q", "noop", now)
+	running.State = model.StateRunning
+	if err := s.CreateJob(running); err != nil {
+		t.Fatal(err)
+	}
+	err := s.DeleteJob("running")
+	if !errors.Is(err, ErrJobRunning) {
+		t.Fatalf("expected ErrJobRunning, got %v", err)
+	}
+	// The job and any attempt history must still be intact.
+	got, err := s.GetJob("running")
+	if err != nil {
+		t.Fatalf("running job vanished after refused delete: %v", err)
+	}
+	if got.State != model.StateRunning {
+		t.Fatalf("running job state changed to %s", got.State)
+	}
+}
+
+func TestDeleteJobRemovesAttemptsForFinished(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+
+	// A finished (succeeded) job carries attempt rows; deleting it must also
+	// remove those attempts so no orphaned records remain.
+	j := newJob("done", "q", "noop", now)
+	j.State = model.StateSucceeded
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAttempt(model.Attempt{JobID: "done", Index: 0, StartedAt: now, EndedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAttempt(model.Attempt{JobID: "done", Index: 1, StartedAt: now, EndedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.ListAttempts("done")
+	if err != nil || len(before) != 2 {
+		t.Fatalf("expected 2 attempts before delete, got %d (%v)", len(before), err)
+	}
+	if err := s.DeleteJob("done"); err != nil {
+		t.Fatalf("delete finished job: %v", err)
+	}
+	if _, err := s.GetJob("done"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+	after, err := s.ListAttempts("done")
+	if err != nil {
+		t.Fatalf("list attempts after delete: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("expected orphaned attempts to be removed, got %d", len(after))
+	}
+}
+
+func TestDeleteJobNotFound(t *testing.T) {
+	s := openTest(t)
+	if err := s.DeleteJob("missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

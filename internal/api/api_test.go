@@ -110,3 +110,61 @@ func TestFlushEndpoint(t *testing.T) {
 		t.Fatalf("flush code %d body %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestDeleteRunningJobReturns409 verifies that a management delete issued while
+// a worker is executing the job is refused with 409, so the worker's later
+// completion writes never land on a deleted row.
+func TestDeleteRunningJobReturns409(t *testing.T) {
+	s, p, h := newServer(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p.RegisterHandler("slow-gated", func(ctx context.Context, j *model.Job) (string, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-release:
+			return "done", nil
+		}
+	})
+
+	rec := do(t, h, "POST", "/jobs", `{"id":"race","queue":"q","type":"slow-gated","max_attempts":3}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code %d body %s", rec.Code, rec.Body.String())
+	}
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	<-started // job is now running in the handler
+
+	rec = do(t, h, "DELETE", "/jobs/race", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 deleting running job, got %d body %s", rec.Code, rec.Body.String())
+	}
+
+	// Let the worker finish; the job must still exist and have a complete record.
+	close(release)
+	p.Wait()
+
+	rec = do(t, h, "GET", "/jobs/race", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected job to survive refused delete, got %d", rec.Code)
+	}
+	var j map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &j); err != nil {
+		t.Fatal(err)
+	}
+	if j["state"] != "succeeded" {
+		t.Fatalf("expected succeeded after finish, got %v", j["state"])
+	}
+
+	// Now that the job is terminal, delete must succeed.
+	rec = do(t, h, "DELETE", "/jobs/race", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete to succeed after finish, got %d body %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.GetJob("race"); err == nil {
+		t.Fatal("expected job to be gone after delete")
+	}
+}

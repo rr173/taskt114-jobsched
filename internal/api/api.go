@@ -259,6 +259,10 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if err := s.store.DeleteJob(id); err != nil {
+		if errors.Is(err, store.ErrJobRunning) {
+			writeError(w, http.StatusConflict, "job is running; cancel it first or wait for it to finish")
+			return
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "job not found")
 			return
@@ -446,6 +450,10 @@ func (s *Server) deleteDead(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if err := s.store.DeleteJob(id); err != nil {
+		if errors.Is(err, store.ErrJobRunning) {
+			writeError(w, http.StatusConflict, "job is running; cancel it first or wait for it to finish")
+			return
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "job not found")
 			return
