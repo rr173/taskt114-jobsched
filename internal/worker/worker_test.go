@@ -87,3 +87,52 @@ func TestFlushSkipsFuture(t *testing.T) {
 		t.Fatalf("future job expected scheduled, got %s", f.State)
 	}
 }
+
+// TestLateSuccessDoesNotOverrideCancel reproduces the reported bug end-to-end.
+// A cancellable handler completes successfully just after the job is cancelled
+// by an operator. The late success must not flip the cancelled job back to
+// succeeded.
+func TestLateSuccessDoesNotOverrideCancel(t *testing.T) {
+	s, p := newPool(t)
+	// Handler blocks until released, then returns success regardless of ctx.
+	release := make(chan struct{})
+	fired := make(chan struct{})
+	p.RegisterHandler("block-then-succeed", func(ctx context.Context, j *model.Job) (string, error) {
+		close(fired)
+		<-release
+		return "done", nil
+	})
+	j := &model.Job{ID: "c1", Queue: "q", Type: "block-then-succeed", State: model.StatePending, RunAt: time.Now(), MaxAttempts: 3}
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-fired // handler is running
+
+	// Operator cancels the running job. This must become the terminal state.
+	p.Cancel("c1")
+	if err := s.Cancel("c1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if got, _ := s.GetJob("c1"); got.State != model.StateCancelled {
+		t.Fatalf("expected cancelled, got %s", got.State)
+	}
+
+	// The handler now completes successfully — a late success arriving after
+	// cancellation. It must be a no-op.
+	close(release)
+	p.Wait()
+
+	got, err := s.GetJob("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.StateCancelled {
+		t.Fatalf("late success overrode cancellation: state=%s result=%q", got.State, got.Result)
+	}
+	if got.Result != "" {
+		t.Fatalf("late success wrote result despite cancellation: %q", got.Result)
+	}
+}

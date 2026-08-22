@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,6 +73,9 @@ func TestSucceed(t *testing.T) {
 	j := newJob("j1", "q", "noop", time.Now())
 	if err := s.CreateJob(j); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := s.Claim("j1"); err != nil {
+		t.Fatalf("claim: %v", err)
 	}
 	if err := s.Succeed("j1", "ok"); err != nil {
 		t.Fatalf("succeed: %v", err)
@@ -165,5 +169,67 @@ func TestStats(t *testing.T) {
 	}
 	if st.Total != 3 {
 		t.Fatalf("expected total 3, got %d", st.Total)
+	}
+}
+
+// TestLateCompletionDoesNotOverrideCancel reproduces the reported bug: a job is
+// cancelled while running, and a late completion (succeed or fail) arrives
+// afterward. The terminal cancelled state must survive and the late write must
+// be rejected rather than resurrecting the job as succeeded.
+func TestLateCompletionDoesNotOverrideCancel(t *testing.T) {
+	s := openTest(t)
+	j := newJob("late", "q", "noop", time.Now())
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim("late"); err != nil { // running
+		t.Fatal(err)
+	}
+	// Operator cancels the running job; this wins the terminal state.
+	if err := s.Cancel("late"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if got, _ := s.GetJob("late"); got.State != model.StateCancelled {
+		t.Fatalf("expected cancelled, got %s", got.State)
+	}
+
+	// Late success arrives from the still-running handler: must be rejected.
+	if err := s.Succeed("late", "done"); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("expected ErrAlreadyTerminal from late succeed, got %v", err)
+	}
+	if got, _ := s.GetJob("late"); got.State != model.StateCancelled || got.Result != "" {
+		t.Fatalf("late succeed overrode cancellation: state=%s result=%q", got.State, got.Result)
+	}
+
+	// Late failure (retry path) arrives: must also be rejected.
+	if err := s.Fail("late", "boom", true, time.Now()); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("expected ErrAlreadyTerminal from late fail, got %v", err)
+	}
+	if got, _ := s.GetJob("late"); got.State != model.StateCancelled {
+		t.Fatalf("late fail overrode cancellation: state=%s", got.State)
+	}
+}
+
+// TestCancelDoesNotOverrideCompletion checks the inverse race: the handler
+// finishes (succeeded) first and then a cancellation arrives. The success must
+// be preserved.
+func TestCancelDoesNotOverrideCompletion(t *testing.T) {
+	s := openTest(t)
+	j := newJob("race", "q", "noop", time.Now())
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim("race"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Succeed("race", "done"); err != nil {
+		t.Fatalf("succeed: %v", err)
+	}
+	// Cancellation arrives after completion: must be a no-op, success preserved.
+	if err := s.Cancel("race"); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("expected ErrAlreadyTerminal from late cancel, got %v", err)
+	}
+	if got, _ := s.GetJob("race"); got.State != model.StateSucceeded {
+		t.Fatalf("late cancel overrode success: state=%s", got.State)
 	}
 }

@@ -308,12 +308,19 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if j.State == model.StateRunning {
 		s.pool.Cancel(id)
 	}
-	j.State = model.StateCancelled
-	j.UpdatedAt = time.Now()
-	if err := s.store.UpdateJob(j); err != nil {
+	// Atomically cancel only if the job is still cancellable. A late completion
+	// may have landed between the GetJob above and now; in that race the
+	// terminal state must win and we surface it rather than clobber it.
+	if err := s.store.Cancel(id); err != nil {
+		if errors.Is(err, store.ErrAlreadyTerminal) {
+			j, _ := s.store.GetJob(id)
+			writeJSON(w, http.StatusConflict, map[string]interface{}{"error": "job already terminal", "job": j})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	j, _ = s.store.GetJob(id)
 	writeJSON(w, http.StatusOK, j)
 }
 

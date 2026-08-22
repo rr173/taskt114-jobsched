@@ -235,39 +235,66 @@ func (s *Store) Claim(id string) (bool, error) {
 	return n > 0, nil
 }
 
-// Succeed marks a job completed with its result payload.
+// ErrAlreadyTerminal is returned when a state transition is attempted against a
+// job that has already reached a stable terminal state (succeeded/dead/cancelled).
+var ErrAlreadyTerminal = errors.New("store: job already terminal")
+
+// Succeed marks a job completed with its result payload. A late completion that
+// races with a cancellation must not resurrect the job: the update is guarded so
+// it only applies while the job is still running, leaving any prior terminal
+// state (cancelled/dead) intact.
 func (s *Store) Succeed(id, result string) error {
-	_, err := s.db.Exec(
-		`UPDATE jobs SET state='succeeded', result=?, updated_at=? WHERE id=?`,
+	res, err := s.db.Exec(
+		`UPDATE jobs SET state='succeeded', result=?, updated_at=? WHERE id=? AND state='running'`,
 		result, time.Now().UnixNano(), id,
 	)
 	if err != nil {
 		return fmt.Errorf("succeed job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("succeed rows: %w", err)
+	}
+	if n == 0 {
+		return ErrAlreadyTerminal
 	}
 	return nil
 }
 
 // Fail records a failed attempt. When willRetry is true the job returns to the
 // pending pool with run_at set to nextRunAt; otherwise it becomes a dead
-// letter. Either way the attempt counter is incremented.
+// letter. Either way the attempt counter is incremented. The transition is
+// guarded so a late failure that races with a cancellation cannot override the
+// terminal cancelled state.
 func (s *Store) Fail(id, errMsg string, willRetry bool, nextRunAt time.Time) error {
 	now := time.Now().UnixNano()
+	var (
+		res sql.Result
+		err error
+	)
 	if willRetry {
-		_, err := s.db.Exec(
-			`UPDATE jobs SET state='pending', attempts=attempts+1, last_error=?, run_at=?, updated_at=? WHERE id=?`,
+		res, err = s.db.Exec(
+			`UPDATE jobs SET state='pending', attempts=attempts+1, last_error=?, run_at=?, updated_at=? WHERE id=? AND state='running'`,
 			errMsg, nextRunAt.UnixNano(), now, id,
 		)
 		if err != nil {
 			return fmt.Errorf("fail retry: %w", err)
 		}
-		return nil
+	} else {
+		res, err = s.db.Exec(
+			`UPDATE jobs SET state='dead', attempts=attempts+1, last_error=?, updated_at=? WHERE id=? AND state='running'`,
+			errMsg, now, id,
+		)
+		if err != nil {
+			return fmt.Errorf("fail dead: %w", err)
+		}
 	}
-	_, err := s.db.Exec(
-		`UPDATE jobs SET state='dead', attempts=attempts+1, last_error=?, updated_at=? WHERE id=?`,
-		errMsg, now, id,
-	)
+	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("fail dead: %w", err)
+		return fmt.Errorf("fail rows: %w", err)
+	}
+	if n == 0 {
+		return ErrAlreadyTerminal
 	}
 	return nil
 }
@@ -483,6 +510,27 @@ func (s *Store) RequeueDead(id string) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// Cancel transitions a cancellable job to the cancelled state atomically. It
+// only applies while the job is pending/scheduled/running, so a concurrent
+// completion that landed first (succeeded/dead) is preserved and the caller is
+// informed via ErrAlreadyTerminal. This makes the terminal state stable under
+// the cancellation-vs-late-completion race: whichever side wins the atomic
+// update wins the final state, and the loser becomes a no-op.
+func (s *Store) Cancel(id string) error {
+	res, err := s.db.Exec(
+		`UPDATE jobs SET state='cancelled', updated_at=? WHERE id=? AND state IN ('pending','scheduled','running')`,
+		time.Now().UnixNano(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("cancel job: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAlreadyTerminal
 	}
 	return nil
 }
