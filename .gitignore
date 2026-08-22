@@ -1,0 +1,5 @@
+vendor/
+.private/
+*.db
+*.db-shm
+*.db-wal
