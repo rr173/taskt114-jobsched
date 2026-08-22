@@ -493,11 +493,19 @@ func (s *Store) CreateSchedule(sc *model.Schedule) error {
 	if sc.CreatedAt.IsZero() {
 		sc.CreatedAt = now
 	}
+	lastRun := sc.LastRun.UnixNano()
+	// Persist a never-run schedule as the integer 0 so it round-trips back to a
+	// Go zero time. Storing UnixNano() of a zero time.Time would instead persist
+	// a huge negative number, which later reads as a non-zero "ancient" time and
+	// makes IsZero()/MissedRuns misclassify the first trigger as heavy backlog.
+	if sc.LastRun.IsZero() {
+		lastRun = 0
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO schedules(id, queue, type, args, interval_ms, enabled, last_run, max_attempts, priority, created_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		sc.ID, sc.Queue, sc.Type, sc.Args,
-		sc.Interval.Milliseconds(), boolToInt(sc.Enabled), sc.LastRun.UnixNano(),
+		sc.Interval.Milliseconds(), boolToInt(sc.Enabled), lastRun,
 		sc.MaxAttempts, sc.Priority, sc.CreatedAt.UnixNano(),
 	)
 	if err != nil {
@@ -540,7 +548,14 @@ func (s *Store) scanSchedule(row interface {
 	sc.Args = args
 	sc.Interval = time.Duration(intervalMs) * time.Millisecond
 	sc.Enabled = enabled != 0
-	sc.LastRun = time.Unix(0, lastRun)
+	// A stored last_run of 0 means the schedule has never fired; restore it to a
+	// Go zero time so callers can rely on IsZero() to tell first-trigger apart
+	// from genuine backlog.
+	if lastRun == 0 {
+		sc.LastRun = time.Time{}
+	} else {
+		sc.LastRun = time.Unix(0, lastRun)
+	}
 	sc.CreatedAt = time.Unix(0, createdAt)
 	return sc, nil
 }

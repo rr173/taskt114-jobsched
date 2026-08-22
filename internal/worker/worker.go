@@ -217,14 +217,27 @@ func (p *Pool) fireDueSchedules(ctx context.Context) {
 			return
 		default:
 		}
-		runs := sc.MissedRuns(p.clk.Now())
-		if runs < 1 {
+		now := p.clk.Now()
+		// A schedule that has never fired is NOT in backlog: only the current
+		// round should be enqueued. Treating a zero LastRun as N missed periods
+		// is the bug that backfilled many historical executions on first trigger.
+		// Genuine backlog (LastRun non-zero, several intervals elapsed) still
+		// catches up, capped at 10 runs.
+		var runs int
+		var runAt time.Time
+		if sc.LastRun.IsZero() {
 			runs = 1
+			runAt = now
+		} else {
+			runs = sc.MissedRuns(now)
+			if runs < 1 {
+				runs = 1
+			}
+			if runs > 10 {
+				runs = 10
+			}
+			runAt = sc.NextRun(now)
 		}
-		if runs > 10 {
-			runs = 10
-		}
-		runAt := sc.NextRun(p.clk.Now())
 		for i := 0; i < runs; i++ {
 			j := &model.Job{
 				ID:          fmt.Sprintf("sched-%s-%d", sc.ID, runAt.UnixNano()),
